@@ -418,7 +418,7 @@ func insertRR(stmt *sql.Stmt, rr dns.RR, domainID int64) error {
 			value = rr.(*dns.AAAA).AAAA.String()
 
 		case dns.TypeNS:
-			value = rr.(*dns.NS).Ns
+			value = normalizeName(rr.(*dns.NS).Ns)
 
 		case dns.TypeDS:
 			ds := rr.(*dns.DS)
@@ -430,12 +430,22 @@ func insertRR(stmt *sql.Stmt, rr dns.RR, domainID int64) error {
 			return fmt.Errorf("unsupported record type")
 	}
 
-	_, err := stmt.Exec(prio, domainID, hdr.Name, stype, value)
+	_, err := stmt.Exec(prio, domainID, normalizeName(hdr.Name), stype, value)
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func normalizeName(n string) string {
+	if len(n) == 0 {
+		return n
+	}
+	if n[len(n)-1] == '.' {
+		return n[0:len(n)-1]
+	}
+	return n
 }
 
 // © 2014 Hugo Landau <hlandau@devever.net>    GPLv3 or later
