@@ -27,6 +27,10 @@ func convertName(n string) (string, error) {
 	return n[2:], nil
 }
 
+func unconvertName(n string) string {
+	return "d/" + n
+}
+
 type Config struct {
 	NamecoinRPCUsername string `default:"" usage:"Namecoin RPC username"`
 	NamecoinRPCPassword string `default:"" usage:"Namecoin RPC password"`
@@ -96,6 +100,14 @@ func Run(cfg Config, startedNotifyFunc func() error) error {
 	if err != nil { return err }
 	prInsertRecord, err := db.Prepare("INSERT INTO records (domain_id,ttl,prio,namecoin_domain_id,name,type,content) VALUES (1,600,$1,$2,$3,$4,$5)")
 	if err != nil { return err }
+	prRollback, err := db.Prepare("SELECT block_hash, block_height FROM namecoin_prevblock ORDER BY id DESC LIMIT 1")
+	if err != nil { return err }
+	prRollbackPop, err := db.Prepare("DELETE FROM namecoin_prevblock WHERE id IN (SELECT id FROM namecoin_prevblock ORDER BY id DESC LIMIT 1)")
+	if err != nil { return err }
+	prRollbackNewer, err := db.Prepare("SELECT id, name FROM namecoin_domains WHERE last_height > $1")
+	if err != nil { return err }
+	prDeleteName, err := db.Prepare("DELETE FROM namecoin_domains WHERE id=$1")
+	if err != nil { return err }
 
 	var prNotify *sql.Stmt
 	if cfg.Notify {
@@ -108,11 +120,133 @@ func Run(cfg Config, startedNotifyFunc func() error) error {
 	// Main loop
 	var tx *sql.Tx
 	lastStatusUpdateTime := time.Time{}
+	diverging := false
+
+	ensureTx := func() error {
+		if tx == nil {
+			var err error
+			tx, err = db.Begin()
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 
 	for {
 		log.Info(fmt.Sprintf("SYNC curHeight=%d", curBlockHeight))
 		events, err := c.Sync(curBlockHash, 1000, true)
-		log.Fatale(err, "call to name_sync")
+		if err == namecoin.ErrSyncNoSuchBlock {
+			// Rollback mode.
+			diverging = true
+
+			err = ensureTx()
+			if err != nil {
+				return err
+			}
+
+			err = tx.Stmt(prRollback).QueryRow().Scan(&curBlockHash, &curBlockHeight)
+			if err != nil {
+				// - we have run out of prevblocks
+				// - any other error
+				// TODO: start again from genesis block
+				return err
+			}
+
+			_, err = tx.Stmt(prRollbackPop).Exec()
+			if err != nil {
+				return err
+			}
+
+			// now try again with the new prevblock
+			continue
+		} else if err != nil {
+			return err
+		}
+
+		if diverging {
+			// We have finished the rollback process and found the divergence point.
+			rows, err := tx.Stmt(prRollbackNewer).Query(curBlockHeight)
+			if err != nil {
+				return err
+			}
+
+			defer func() {
+				if rows != nil {
+					rows.Close()
+				}
+			}()
+
+			// Get the correct values at this point for all newer names.
+			for rows.Next() {
+				var domainID int64
+				var nName string // name is in namecoin format, e.g. "d/example"
+
+				err = rows.Scan(&domainID, &nName)
+				if err != nil {
+					return err
+				}
+
+				v, err := c.Query(nName)
+				if err != nil {
+					// assume the name does not exist anymore, delete it
+					_, err = tx.Stmt(prDeleteName).Exec(domainID)
+					if err != nil {
+						return err
+					}
+				}
+
+				// reconvert
+				dnsName, err := convertName(nName)
+				if err != nil {
+					return err
+				}
+
+				dnsNameFull := dnsName + ".bit"
+
+				// Determine the namecoin domain ID, creating the record if it doesn't already exist.
+				// Update the block height to the current value.
+				_, err = tx.Stmt(prUpdateDomainHeight).Exec(curBlockHeight, domainID)
+				if err != nil {
+					return err
+				}
+
+				// Delete the old records for this domain.
+				_, err = tx.Stmt(prDeleteDomainRecords).Exec(domainID)
+				if err != nil {
+					return err
+				}
+
+				// Determine the new records for this domain.
+				// We don't count each domain as its own zone, so we don't add SOA
+				// records and use NS records only where a delegation is requested.
+				rrs, err := backend.Convert(dnsNameFull, v)
+				if err != nil {
+					//log.Info(fmt.Sprintf("Couldn't process domain \"%s\": %s", ev.Name, err))
+					continue
+				}
+
+				// Add the new records for this domain.
+				for _, rr := range rrs {
+					err = insertRR(tx.Stmt(prInsertRecord), rr, domainID)
+					if err != nil {
+						return err
+					}
+				}
+			}
+
+			rows.Close()
+			rows = nil
+
+			err = tx.Commit()
+			if err != nil {
+				return err
+			}
+
+			tx = nil
+			diverging = false
+			// rollback complete, resume normal operation
+		}
 
 		if startedNotifyFunc != nil {
 			// Defer the call to startedNotifyFunc until after the call to name_sync so that we error out before declaring
@@ -146,10 +280,17 @@ func Run(cfg Config, startedNotifyFunc func() error) error {
 		}
 
 		for evIdx, ev := range events {
-			if tx == nil {
-				tx, err = db.Begin()
-				log.Fatale(err)
+			err = ensureTx()
+			if err != nil {
+				return err
 			}
+
+			/*if tx == nil {
+				tx, err = db.Begin()
+				if err != nil {
+					return err
+				}
+			}*/
 
 			switch ev.Type {
 				case "update", "firstupdate":
@@ -163,6 +304,31 @@ func Run(cfg Config, startedNotifyFunc func() error) error {
 
 					dnsNameFull := dnsName + ".bit"
 
+					// Determine the namecoin domain ID, creating the record if it doesn't already exist.
+					// Update the block height to the current value.
+					err = tx.Stmt(prGetDomainID).QueryRow(ev.Name).Scan(&domainID)
+					if err != nil {
+						err = tx.Stmt(prInsertDomain).QueryRow(ev.Name, curBlockHeight).Scan(&domainID)
+						if err != nil {
+							return err
+						}
+					} else {
+						_, err = tx.Stmt(prUpdateDomainHeight).Exec(curBlockHeight, domainID)
+						if err != nil {
+							return err
+						}
+					}
+
+					// Delete the old records for this domain.
+					_, err = tx.Stmt(prDeleteDomainRecords).Exec(domainID)
+					if err != nil {
+						return err
+					}
+
+					if doNotify {
+						updatedSet[dnsNameFull] = struct{}{}
+					}
+
 					// Determine the new records for this domain.
 					// We don't count each domain as its own zone, so we don't add SOA
 					// records and use NS records only where a delegation is requested.
@@ -172,42 +338,31 @@ func Run(cfg Config, startedNotifyFunc func() error) error {
 						continue
 					}
 
-					// Determine the namecoin domain ID, creating the record if it doesn't already exist.
-					// Update the block height to the current value.
-					err = tx.Stmt(prGetDomainID).QueryRow(ev.Name).Scan(&domainID)
-					if err != nil {
-						err = tx.Stmt(prInsertDomain).QueryRow(ev.Name, curBlockHeight).Scan(&domainID)
-						log.Fatale(err)
-					} else {
-						_, err = tx.Stmt(prUpdateDomainHeight).Exec(curBlockHeight, domainID)
-						log.Fatale(err)
-					}
-
-					// Delete the old records for this domain.
-					_, err = tx.Stmt(prDeleteDomainRecords).Exec(domainID)
-					log.Fatale(err)
-
 					// Add the new records for this domain.
 					for _, rr := range rrs {
 						err = insertRR(tx.Stmt(prInsertRecord), rr, domainID)
-						log.Fatale(err)
-					}
-
-					if doNotify {
-						updatedSet[dnsNameFull] = struct{}{}
+						if err != nil {
+							return err
+						}
 					}
 
 				case "atblock":
 					_, err = tx.Stmt(prUpdateState).Exec(ev.BlockHash, ev.BlockHeight)
-					log.Fatale(err)
+					if err != nil {
+						return err
+					}
 
 					var prevBlockID int64
 					err = tx.Stmt(prInsertPrevBlock).QueryRow(ev.BlockHash, ev.BlockHeight).Scan(&prevBlockID)
-					log.Fatale(err)
+					if err != nil {
+						return err
+					}
 
 					if prevBlockID > numPrevBlocksToKeep {
 						_, err = tx.Stmt(prTruncatePrevBlock).Exec(prevBlockID - numPrevBlocksToKeep)
-						log.Fatale(err)
+						if err != nil {
+							return err
+						}
 					}
 
 					// Notify
@@ -235,7 +390,9 @@ func Run(cfg Config, startedNotifyFunc func() error) error {
 					// Commit.
 					if !skipCommit {
 						err = tx.Commit()
-						log.Fatale(err)
+						if err != nil {
+							return err
+						}
 
 						curBlockHash   = ev.BlockHash
 						curBlockHeight = ev.BlockHeight
