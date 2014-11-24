@@ -206,6 +206,9 @@ func Run(cfg Config, startedNotifyFunc func() error) error {
 
 				// Determine the namecoin domain ID, creating the record if it doesn't already exist.
 				// Update the block height to the current value.
+				// (The name from name_show might actually be newer than this height, but if so it will
+				//  rapidly be fixed. This avoids the need to change the .Query() interface to provide
+				//  height.)
 				_, err = tx.Stmt(prUpdateDomainHeight).Exec(curBlockHeight, domainID)
 				if err != nil {
 					return err
