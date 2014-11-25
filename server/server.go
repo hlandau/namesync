@@ -39,11 +39,10 @@ type Config struct {
 	NamecoinRPCPassword string `default:"" usage:"Namecoin RPC password"`
 	NamecoinRPCAddress  string `default:"127.0.0.1:8332" usage:"Namecoin RPC server address"`
 	DatabaseType        string `default:"postgres" usage:"Database type to use (supported values: postgres)"`
-	//"postgres", "user=namecoin_dev dbname=namecoin_dev sslmode=disable password=namecoin_dev")
-	DatabaseURL      string `default:"" usage:"Database URL or other connection string (postgres: dbname=... user=... password=...)"`
-	Notify           bool   `default:"false" usage:"Whether to notify (for supported databases only)"`
-	NotifyName       string `default:"namecoin_updated" usage:"Event name to use for notification"`
-	StatusUpdateFunc func(status string)
+	DatabaseURL         string `default:"" usage:"Database URL or other connection string (postgres: dbname=... user=... password=...)"`
+	Notify              bool   `default:"false" usage:"Whether to notify (for supported databases only)"`
+	NotifyName          string `default:"namecoin_updated" usage:"Event name to use for notification"`
+	StatusUpdateFunc    func(status string)
 }
 
 func Run(cfg Config, startedNotifyFunc func() error) error {
