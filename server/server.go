@@ -1,38 +1,25 @@
 package server
 
+import "github.com/hlandau/ncbtcjsontypes"
 import "github.com/hlandau/ncdns/namecoin"
 import "github.com/hlandau/ncdns/ncdomain"
-import "github.com/hlandau/degoutils/log"
+import "github.com/hlandau/ncdns/util"
+import "github.com/hlandau/xlog"
 import "github.com/miekg/dns"
+import "fmt"
+import "time"
+import "strings"
 import _ "github.com/lib/pq"
 import "database/sql"
-import "regexp"
-import "fmt"
-import "strings"
-import "time"
-import "reflect"
 
 const mainNetGenesisHash = "000000000062b72c5e2ceb45fbc8587e807c155b0da735e6483dfba2f0a9c770"
 const genesisHeight = 0
 const numPrevBlocksToKeep = 50
 
-var re_validName = regexp.MustCompilePOSIX(`^d/(xn--)?([a-z0-9]*-)*[a-z0-9]+$`)
+var log, Log = xlog.New("namesync")
 
-const maxNameLength = 65
-
-var errInvalidName = fmt.Errorf("invalid name")
-
-func unused(x interface{}) {}
-
-func convertName(n string) (string, error) {
-	if len(n) > maxNameLength || !re_validName.MatchString(n) {
-		return "", errInvalidName
-	}
-	return n[2:], nil
-}
-
-func unconvertName(n string) string {
-	return "d/" + n
+func init() {
+	Log.SetSeverity(xlog.SevNotice)
 }
 
 type Config struct {
@@ -45,487 +32,665 @@ type Config struct {
 	NotifyName          string `default:"namecoin_updated" usage:"Event name to use for notification"`
 	NSECMode            string `default:"auto" usage:"NSEC mode to use (nsec3narrow, nsec3 or nsec)"`
 	StatusUpdateFunc    func(status string)
+	StartedNotifyFunc   func() error
+	Suffix              string `default:"bit" usage:"Zone name (no trailing dot, e.g. 'bit')"`
 }
 
-// Prepare statements
-type prepareds struct {
-	GetDomainID         *sql.Stmt `SELECT id FROM namecoin_domains WHERE name=$1 LIMIT 1`
-	InsertDomain        *sql.Stmt `INSERT INTO namecoin_domains (name, last_height, value) VALUES ($1,$2,$3) RETURNING id`
-	UpdateDomain        *sql.Stmt `UPDATE namecoin_domains SET last_height=$1, value=$2 WHERE id=$3`
-	DeleteDomainRecords *sql.Stmt `DELETE FROM records WHERE namecoin_domain_id=$1`
-	UpdateState         *sql.Stmt `UPDATE namecoin_state SET cur_block_hash=$1, cur_block_height=$2`
-	InsertPrevBlock     *sql.Stmt `INSERT INTO namecoin_prevblock (block_hash, block_height) VALUES ($1,$2) RETURNING id`
-	TruncatePrevBlock   *sql.Stmt `DELETE FROM namecoin_prevblock WHERE id < $1`
-	InsertRecord        *sql.Stmt `INSERT INTO records (domain_id,ttl,prio,namecoin_domain_id,name,type,content,auth,ordername) VALUES (1,600,$1,$2,$3,$4,$5,$6,$7)`
-	Rollback            *sql.Stmt `SELECT block_hash, block_height FROM namecoin_prevblock ORDER BY id DESC LIMIT 1`
-	RollbackPop         *sql.Stmt `DELETE FROM namecoin_prevblock WHERE id IN (SELECT id FROM namecoin_prevblock ORDER BY id DESC LIMIT 1)`
-	RollbackNewer       *sql.Stmt `SELECT id, name FROM namecoin_domains WHERE last_height > $1`
-	DeleteName          *sql.Stmt `DELETE FROM namecoin_domains WHERE id=$1`
-	Notify              *sql.Stmt `SELECT pg_notify('namecoin_updated', $1)`
+type Server struct {
+	cfg            Config
+	nc             namecoin.Conn
+	db             *sql.DB
+	pr             prepareds
+	curBlockHash   string
+	curBlockHeight int64
+	nsec3param     dns.NSEC3PARAM
+
+	tx                    *sql.Tx
+	tpr                   *prepareds
+	maxBlockHeightAtStart int64
+	lastStatusUpdateTime  time.Time
+	updatedSet            map[string]struct{}
+	domainID              int64
+	diverging             bool
 }
 
-func (p *prepareds) Prepare(db *sql.DB) error {
-	t := reflect.TypeOf(p).Elem()
-	v := reflect.Indirect(reflect.ValueOf(p))
-	nf := t.NumField()
-	for i := 0; i < nf; i++ {
-		f := t.Field(i)
-		if f.Tag == "" {
-			continue
-		}
-		pr, err := db.Prepare(string(f.Tag))
-		if err != nil {
-			fmt.Printf("error while preparing field %d", i+1)
-			return err
-		}
-		fv := v.Field(i)
-		fv.Set(reflect.ValueOf(pr))
+func Run(cfg Config) error {
+	s := &Server{
+		cfg:        cfg,
+		updatedSet: map[string]struct{}{},
 	}
 
-	return nil
-}
-
-func (p *prepareds) Close() error {
-	t := reflect.TypeOf(p).Elem()
-	v := reflect.Indirect(reflect.ValueOf(p))
-	nf := t.NumField()
-	for i := 0; i < nf; i++ {
-		f := t.Field(i)
-		if f.Tag == "" {
-			continue
-		}
-		fv := v.Field(i)
-		fvi := fv.Interface()
-		if fvi != nil {
-			if stmt, ok := fvi.(*sql.Stmt); ok {
-				stmt.Close()
-				fv.Set(reflect.ValueOf((*sql.Stmt)(nil)))
-			}
-		}
+	if s.cfg.Suffix == "" {
+		s.cfg.Suffix = "bit"
 	}
-	return nil
-}
 
-func (p *prepareds) Tx(tx *sql.Tx) (px *prepareds, err error) {
-	px = &prepareds{}
-	t := reflect.TypeOf(p).Elem()
-	v := reflect.Indirect(reflect.ValueOf(p))
-	v2 := reflect.Indirect(reflect.ValueOf(px))
-	nf := t.NumField()
-	for i := 0; i < nf; i++ {
-		f := t.Field(i)
-		if f.Tag == "" {
-			continue
-		}
-		fv := v.Field(i)
-		fv2 := v2.Field(i)
-		fvi := fv.Interface()
-		if fvi != nil {
-			if stmt, ok := fvi.(*sql.Stmt); ok {
-				fv2.Set(reflect.ValueOf(tx.Stmt(stmt)))
-			}
-		}
+	s.nc = namecoin.Conn{
+		Username: s.cfg.NamecoinRPCUsername,
+		Password: s.cfg.NamecoinRPCPassword,
+		Server:   s.cfg.NamecoinRPCAddress,
 	}
-	return
-}
 
-func Run(cfg Config, startedNotifyFunc func() error) error {
-	// Set up RPC connection
-	c := namecoin.Conn{cfg.NamecoinRPCUsername, cfg.NamecoinRPCPassword, cfg.NamecoinRPCAddress}
-
-	// Determine current block chain height
-	maxBlockHeightAtStart, err := c.CurHeight()
+	maxBlockHeightAtStart, err := s.nc.CurHeight()
 	if err != nil {
 		return err
 	}
 
-	// Open database
-	db, err := sql.Open(cfg.DatabaseType, cfg.DatabaseURL)
+	s.maxBlockHeightAtStart = int64(maxBlockHeightAtStart)
+
+	db, err := sql.Open(s.cfg.DatabaseType, s.cfg.DatabaseURL)
 	if err != nil {
 		return err
 	}
 
-	defer db.Close()
+	s.db = db
+	s.db.SetMaxIdleConns(1)
+	s.db.SetMaxOpenConns(2)
 
-	db.SetMaxIdleConns(1)
-	db.SetMaxOpenConns(1)
-
-	if cfg.DatabaseType != "postgres" {
-		cfg.Notify = false
+	if s.cfg.DatabaseType != "postgres" {
+		s.cfg.Notify = false
 	}
 
-	if cfg.NSECMode == "" || cfg.NSECMode == "auto" {
-		ns3p := ""
-		err := db.QueryRow("SELECT content FROM domainmetadata WHERE kind='NSEC3PARAM' and domain_id=1 LIMIT 1").Scan(&ns3p)
-		if err != nil {
-			cfg.NSECMode = "nsec3narrow"
-		} else {
-			cfg.NSECMode = "nsec3"
-		}
-	}
-
-	switch cfg.NSECMode {
-	case "nsec3narrow":
-	case "nsec3":
-		ns3p := ""
-		err := db.QueryRow("SELECT content FROM domainmetadata WHERE kind='NSEC3PARAM' AND domain_id=1 LIMIT 1").Scan(&ns3p)
-		if err == sql.ErrNoRows {
-			return fmt.Errorf("PowerDNS must have NSEC3PARAM option for domain set to '1 0 0 8f' when NSEC3 non-narrow mode is used")
-		} else if err == nil {
-			if strings.ToLower(ns3p) != "1 0 0 8f" {
-				return fmt.Errorf("PowerDNS must have NSEC3PARAM option for domain set to '1 0 0 8f' when NSEC3 non-narrow mode is used")
-			}
-		}
-	default:
-		panic("unsupported NSEC mode")
-	}
-
-	// Determine current state of database
-	var curBlockHash = mainNetGenesisHash
-	var curBlockHeight = genesisHeight
-
-	err = db.QueryRow("SELECT cur_block_hash, cur_block_height FROM namecoin_state LIMIT 1").Scan(&curBlockHash, &curBlockHeight)
-	if err == sql.ErrNoRows {
-		// Database not primed, insert genesis block
-		_, err = db.Exec("INSERT INTO namecoin_state (cur_block_hash, cur_block_height) VALUES ($1,$2)", curBlockHash, curBlockHeight)
-		if err != nil {
-			return err
-		}
-	} else if err != nil {
-		return err
-	}
-
-	pr := prepareds{}
-	err = pr.Prepare(db)
+	err = s.determineDomainID()
 	if err != nil {
 		return err
 	}
-	defer pr.Close()
 
-	// Main loop
-	var tx *sql.Tx
-	var tpr *prepareds
-	lastStatusUpdateTime := time.Time{}
-	diverging := false
-
-	ensureTx := func() error {
-		if tx == nil {
-			var err error
-			tx, err = db.Begin()
-			if err != nil {
-				return err
-			}
-			tpr, err = pr.Tx(tx)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
+	err = s.determineNSECMode()
+	if err != nil {
+		return err
 	}
 
+	s.curBlockHash, s.curBlockHeight, err = s.determineState()
+	if err != nil {
+		return err
+	}
+
+	log.Infof("Starting with initial state height=%d, block=%s", s.curBlockHeight, s.curBlockHash)
+
+	err = s.pr.Prepare(s.db)
+	if err != nil {
+		return err
+	}
+
+	defer s.pr.Close()
 	defer func() {
-		if tpr != nil {
-			tpr.Close()
+		if s.tpr != nil {
+			s.tpr.Close()
 		}
 	}()
 
-	iterStartTime := time.Now()
-	prevBlockHeight := curBlockHeight
+	err = s.loop()
+	if err != nil {
+		return err
+	}
 
-	for {
-		newNow := time.Now()
-		timeTaken := newNow.Sub(iterStartTime)
-		blockInc := curBlockHeight - prevBlockHeight
-		if blockInc == 0 {
-			blockInc = 1
-		}
-		timePerBlock := timeTaken.Seconds() / float64(blockInc)
-		log.Info(fmt.Sprintf("SYNC curHeight=%6d  %2.2fs  %6d  %7.0f blocks/s", curBlockHeight, timeTaken.Seconds(), blockInc, 1/timePerBlock))
-		iterStartTime = newNow
-		prevBlockHeight = curBlockHeight
+	return nil
+}
 
-		events, err := c.Sync(curBlockHash, 10000, true)
-		if err == namecoin.ErrSyncNoSuchBlock {
-			// Rollback mode.
-			diverging = true
+func (s *Server) determineDomainID() error {
+	err := s.db.QueryRow("SELECT id FROM domains WHERE name=$1 LIMIT 1", s.cfg.Suffix).Scan(&s.domainID)
+	if err != nil {
+		return err
+	}
 
-			err = ensureTx()
-			if err != nil {
-				return err
-			}
+	return nil
+}
 
-			err = tpr.Rollback.QueryRow().Scan(&curBlockHash, &curBlockHeight)
-			if err != nil {
-				// - we have run out of prevblocks
-				// - any other error
-				// TODO: start again from genesis block
-				return err
-			}
+func (s *Server) determineNSECMode() error {
+	s.autodetectNSEC3()
 
-			_, err = tpr.RollbackPop.Exec()
-			if err != nil {
-				return err
-			}
-
-			// now try again with the new prevblock
-			continue
+	switch s.cfg.NSECMode {
+	case "nsec3":
+		ns3p, err := s.getNSEC3Param()
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("PowerDNS database must have NSEC3PARAM option for domain when NSEC3 non-narrow mode is used")
 		} else if err != nil {
 			return err
 		}
 
-		if diverging {
-			// We have finished the rollback process and found the divergence point.
-			rows, err := tpr.RollbackNewer.Query(curBlockHeight)
-			if err != nil {
-				return err
-			}
-
-			defer func() {
-				if rows != nil {
-					rows.Close()
-				}
-			}()
-
-			// Get the correct values at this point for all newer names.
-			for rows.Next() {
-				var domainID int64
-				var nName string // name is in namecoin format, e.g. "d/example"
-
-				err = rows.Scan(&domainID, &nName)
-				if err != nil {
-					return err
-				}
-
-				v, err := c.Query(nName)
-				if err != nil {
-					// assume the name does not exist anymore, delete it
-					_, err = tpr.DeleteName.Exec(domainID)
-					if err != nil {
-						return err
-					}
-				}
-
-				// reconvert
-				dnsName, err := convertName(nName)
-				if err != nil {
-					return err
-				}
-
-				dnsNameFull := dnsName + ".bit"
-
-				// Determine the namecoin domain ID, creating the record if it doesn't already exist.
-				// Update the block height to the current value.
-				// (The name from name_show might actually be newer than this height, but if so it will
-				//  rapidly be fixed. This avoids the need to change the .Query() interface to provide
-				//  height.)
-				_, err = tpr.UpdateDomain.Exec(curBlockHeight, v, domainID)
-				if err != nil {
-					return err
-				}
-
-				// Delete the old records for this domain.
-				_, err = tpr.DeleteDomainRecords.Exec(domainID)
-				if err != nil {
-					return err
-				}
-
-				// Determine the new records for this domain.
-				// We don't count each domain as its own zone, so we don't add SOA
-				// records and use NS records only where a delegation is requested.
-				vv, err := ncdomain.ParseValue(v, nil)
-				if err != nil {
-					continue
-				}
-
-				rrs, err := vv.RRsRecursive(nil, dnsNameFull)
-				if err != nil {
-					//log.Info(fmt.Sprintf("Couldn't process domain \"%s\": %s", ev.Name, err))
-					continue
-				}
-
-				// Add the new records for this domain.
-				err = insertRRs(tpr.InsertRecord, rrs, domainID, cfg.NSECMode)
-				if err != nil {
-					return err
-				}
-			}
-
-			rows.Close()
-			rows = nil
-
-			tpr.Close()
-			tpr = nil
-
-			err = tx.Commit()
-			if err != nil {
-				return err
-			}
-
-			tx = nil
-			diverging = false
-			// rollback complete, resume normal operation
+		nsr, err := dns.NewRR(". IN NSEC3PARAM " + ns3p)
+		if err != nil {
+			return err
 		}
 
-		if startedNotifyFunc != nil {
-			// Defer the call to startedNotifyFunc until after the call to name_sync so that we error out before declaring
-			// ourselves as started in the event the Namecoin RPC server doesn't support name_sync, which is likely to be
-			// one of the most common error cases.
-			err = startedNotifyFunc()
-			if err != nil {
-				return err
-			}
+		s.nsec3param = *(nsr.(*dns.NSEC3PARAM))
 
-			startedNotifyFunc = nil
-		}
+	case "nsec3narrow":
+		// Don't need to do anything.
 
-		updatedSet := map[string]struct{}{}
+	default:
+		return fmt.Errorf("unknown NSEC mode: %v", s.cfg.NSECMode)
+	}
 
-		catchUpThreshold := maxBlockHeightAtStart - 2
-		catchingUp := curBlockHeight < catchUpThreshold
-		doNotify := (cfg.Notify && !catchingUp)
+	return nil
+}
 
-		if cfg.StatusUpdateFunc != nil {
-			now := time.Now()
-			if now.Sub(lastStatusUpdateTime) > 1*time.Minute {
-				lastStatusUpdateTime = now
-
-				status := "ok"
-				if catchingUp {
-					status = fmt.Sprintf("ok (catching up: %d/%d)", curBlockHeight, maxBlockHeightAtStart)
-				}
-				cfg.StatusUpdateFunc(status)
-			}
-		}
-
-		for evIdx, ev := range events {
-			err = ensureTx()
-			if err != nil {
-				return err
-			}
-
-			switch ev.Type {
-			case "update", "firstupdate":
-				var domainID int64
-
-				// Determine whether the name maps to a valid DNS name.
-				dnsName, err := convertName(ev.Name)
-				if err != nil {
-					continue
-				}
-
-				dnsNameFull := dnsName + ".bit"
-
-				// Determine the namecoin domain ID, creating the record if it doesn't already exist.
-				// Update the block height to the current value.
-				err = tpr.GetDomainID.QueryRow(ev.Name).Scan(&domainID)
-				if err != nil {
-					err = tpr.InsertDomain.QueryRow(ev.Name, curBlockHeight, ev.Value).Scan(&domainID)
-					if err != nil {
-						return err
-					}
-				} else {
-					_, err = tpr.UpdateDomain.Exec(curBlockHeight, ev.Value, domainID)
-					if err != nil {
-						return err
-					}
-				}
-
-				// Delete the old records for this domain.
-				_, err = tpr.DeleteDomainRecords.Exec(domainID)
-				if err != nil {
-					return err
-				}
-
-				if doNotify {
-					updatedSet[dnsNameFull] = struct{}{}
-				}
-
-				// Determine the new records for this domain.
-				// We don't count each domain as its own zone, so we don't add SOA
-				// records and use NS records only where a delegation is requested.
-				vv, err := ncdomain.ParseValue(ev.Value, nil)
-				if err != nil {
-					continue
-				}
-
-				rrs, err := vv.RRsRecursive(nil, dnsNameFull)
-				if err != nil {
-					//log.Info(fmt.Sprintf("Couldn't process domain \"%s\": %s", ev.Name, err))
-					continue
-				}
-
-				// Add the new records for this domain.
-				err = insertRRs(tpr.InsertRecord, rrs, domainID, cfg.NSECMode)
-				if err != nil {
-					return err
-				}
-
-			case "atblock":
-				_, err = tpr.UpdateState.Exec(ev.BlockHash, ev.BlockHeight)
-				if err != nil {
-					return err
-				}
-
-				var prevBlockID int64
-				err = tpr.InsertPrevBlock.QueryRow(ev.BlockHash, ev.BlockHeight).Scan(&prevBlockID)
-				if err != nil {
-					return err
-				}
-
-				if prevBlockID > numPrevBlocksToKeep {
-					_, err = tpr.TruncatePrevBlock.Exec(prevBlockID - numPrevBlocksToKeep)
-					if err != nil {
-						return err
-					}
-				}
-
-				// Notify
-				if doNotify {
-					updateds := "inv"
-					for k := range updatedSet {
-						updateds += " " + k
-						if len(updateds) > 6000 {
-							_, err = tpr.Notify.Exec(updateds)
-							log.Infoe(err)
-							updateds = "inv"
-						}
-					}
-
-					if len(updateds) > 3 {
-						_, err = tpr.Notify.Exec(updateds)
-						log.Infoe(err)
-					}
-					// don't care about errors
-				}
-
-				// For performance, only apply the last commit in a sync batch.
-				skipCommit := evIdx < (len(events) - 1)
-
-				// Commit.
-				if !skipCommit {
-					tpr.Close()
-					tpr = nil
-
-					err = tx.Commit()
-					if err != nil {
-						return err
-					}
-
-					curBlockHash = ev.BlockHash
-					curBlockHeight = ev.BlockHeight
-
-					tx = nil
-				}
-			}
+func (s *Server) autodetectNSEC3() {
+	if s.cfg.NSECMode == "" || s.cfg.NSECMode == "auto" {
+		_, err := s.getNSEC3Param()
+		if err != nil {
+			s.cfg.NSECMode = "nsec3narrow"
+		} else {
+			s.cfg.NSECMode = "nsec3"
 		}
 	}
 }
 
-func insertRR(stmt *sql.Stmt, rr dns.RR, domainID int64, hasNS bool, depthBelowNS int, nsecMode string) error {
-	prio := 0
+func (s *Server) getNSEC3Param() (string, error) {
+	var ns3p string
+	err := s.db.QueryRow("SELECT content FROM domainmetadata WHERE kind='NSEC3PARAM' AND domain_id=$1 LIMIT 1", s.domainID).Scan(&ns3p)
+	if err != nil {
+		return "", err
+	}
+
+	return ns3p, nil
+}
+
+func (s *Server) determineState() (curBlockHash string, curBlockHeight int64, err error) {
+	err = s.db.QueryRow("SELECT cur_block_hash, cur_block_height FROM namecoin_state LIMIT 1").
+		Scan(&curBlockHash, &curBlockHeight)
+
+	if err == sql.ErrNoRows {
+		// Database not primed, insert genesis block.
+		curBlockHash = mainNetGenesisHash
+		curBlockHeight = genesisHeight
+
+		_, err = s.db.Exec("INSERT INTO namecoin_state (cur_block_hash, cur_block_height) VALUES ($1,$2)",
+			curBlockHash, curBlockHeight)
+	}
+
+	return
+}
+
+func (s *Server) ensureTx() error {
+	if s.tx == nil {
+		var err error
+		s.tx, err = s.db.Begin()
+		if err != nil {
+			return err
+		}
+		s.tpr, err = s.pr.Tx(s.tx)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) commit() error {
+	if s.tx == nil {
+		return nil
+	}
+
+	s.tpr.Close()
+	s.tpr = nil
+
+	s.tx.Commit()
+	s.tx = nil
+
+	return nil
+}
+
+func (s *Server) loop() error {
+	for {
+		events, err := s.nc.Sync(s.curBlockHash, 10000, true)
+		if err == namecoin.ErrSyncNoSuchBlock {
+			// Finish any open transaction.
+			err = s.commit()
+			if err != nil {
+				return err
+			}
+
+			// Find a common point of divergence.
+			err = s.rollback()
+			if err != nil {
+				return err
+			}
+
+			// Now try again with the new prevblock.
+			continue
+		}
+
+		err = s.handleDivergence()
+		if err != nil {
+			return err
+		}
+
+		if s.cfg.StartedNotifyFunc != nil {
+			// Defer the call to startedNotifyFunc until after the call to name_sync so that we error out
+			// before declaring ourselves as started in the event the Namecoin RPC server doesn't support
+			// name_sync.
+			err = s.cfg.StartedNotifyFunc()
+			if err != nil {
+				return err
+			}
+
+			s.cfg.StartedNotifyFunc = nil
+		}
+
+		s.logProgress()
+
+		if s.cfg.StatusUpdateFunc != nil {
+			now := time.Now()
+			if now.Sub(s.lastStatusUpdateTime) > 1*time.Minute {
+				s.lastStatusUpdateTime = now
+				status := "ok"
+				if s.isCatchingUp() {
+					status = fmt.Sprintf("ok (catching up: %d/%d)", s.curBlockHeight, s.maxBlockHeightAtStart)
+				}
+				s.cfg.StatusUpdateFunc(status)
+			}
+		}
+
+		err = s.processEvents(events)
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (s *Server) logProgress() {
+	log.Noticef("SYNC curHeight=%d", s.curBlockHeight)
+}
+
+func (s *Server) rollback() error {
+	// Rollback mode.
+	s.diverging = true
+
+	err := s.ensureTx()
+	if err != nil {
+		return err
+	}
+
+	err = s.tpr.Rollback.QueryRow().Scan(&s.curBlockHash, &s.curBlockHeight)
+	if err != nil {
+		// - We have run out of prevblocks.
+		// - Any other error.
+		// TODO: start again from genesis block.
+		return err
+	}
+
+	_, err = s.tpr.RollbackPop.Exec()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Server) handleDivergence() error {
+	if !s.diverging {
+		return nil
+	}
+
+	// We have finished the rollback process and found the divergence point.
+	rows, err := s.tpr.RollbackNewer.Query(s.curBlockHeight)
+	if err != nil {
+		return err
+	}
+
+	defer rows.Close()
+
+	// Get the correct values at this point for all newer names.
+	for rows.Next() {
+		var domainID int64
+		var nName string // name is in namecoin format, e.g. "d/example"
+
+		err = rows.Scan(&domainID, &nName)
+		if err != nil {
+			return err
+		}
+
+		v, err := s.nc.Query(nName)
+		if err != nil {
+			// Assume the name does not exist anymore, delete it.
+			_, err = s.tpr.DeleteName.Exec(domainID)
+			if err != nil {
+				return err
+			}
+
+			// TODO: dependent names
+			continue
+		}
+
+		// Fabricate an update event.
+		ev := ncbtcjsontypes.NameSyncEvent{
+			Type:  "update", // XXX
+			Name:  nName,
+			Value: v,
+		}
+
+		err = s.processUpdate(ev)
+		if err != nil {
+			return err
+		}
+	}
+
+	err = s.commit()
+	if err != nil {
+		return err
+	}
+
+	s.diverging = false
+	return nil
+}
+
+func (s *Server) processEvents(events []ncbtcjsontypes.NameSyncEvent) error {
+	for evIdx, ev := range events {
+		err := s.ensureTx()
+		if err != nil {
+			return err
+		}
+
+		switch ev.Type {
+		case "update", "firstupdate":
+			err = s.processUpdate(ev)
+		case "atblock":
+			// For performance, only apply the last commit in a sync batch.
+			skipCommit := evIdx < (len(events) - 1)
+			err = s.processAtblock(ev, !skipCommit)
+		}
+
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *Server) processUpdate(ev ncbtcjsontypes.NameSyncEvent) error {
+	log.Debugf("update %#v", ev.Name)
+
+	// Determine whether the name maps to a valid DNS name.
+	basename, err := util.NamecoinKeyToBasename(ev.Name)
+	if err != nil {
+		return nil
+	}
+
+	// Update domain name and get ID.
+	domainID, err := s.setDomainValue(ev.Name, ev.Value, s.curBlockHeight)
+	if err != nil {
+		return fmt.Errorf("can't set domain value: %v", err)
+	}
+
+	// Delete the old records for this domain.
+	_, err = s.tpr.DeleteDomainRecords.Exec(domainID)
+	if err != nil {
+		return fmt.Errorf("can't delete domain records: %v", err)
+	}
+
+	_, err = s.tpr.DeleteDomainDeps.Exec(domainID)
+	if err != nil {
+		return fmt.Errorf("can't delete domain deps: %v", err)
+	}
+
+	dnsname := basename + "." + s.cfg.Suffix
+	s.setNotification(dnsname)
+
+	notedDeps := map[string]struct{}{}
+
+	resolveFunc := func(name string) (string, error) {
+		var value string
+
+		qerr := s.tpr.GetDomainValue.QueryRow(name).Scan(&value)
+
+		if _, ok := notedDeps[name]; !ok {
+			deferred := (qerr != nil)
+
+			_, err := s.tpr.InsertDomainDep.Exec(domainID, name, deferred)
+			if err != nil {
+				return "", err
+			}
+
+			notedDeps[name] = struct{}{}
+		}
+
+		if qerr != nil {
+			return "", qerr
+		}
+
+		return value, nil
+	}
+
+	// Determine the new records for this domain.
+	// We don't count each domain as its own zone, so we don't add SOA
+	// records and use NS records only where a delegation is requested.
+	vv := ncdomain.ParseValue(ev.Name, ev.Value, resolveFunc, nil)
+	if vv == nil {
+		return nil
+	}
+
+	rrs, err := vv.RRsRecursive(nil, dnsname, dnsname)
+	if err != nil {
+		return err
+	}
+
+	err = s.insertRRs(rrs, domainID)
+	if err != nil {
+		return err
+	}
+
+	// Update dependencies.
+	rows, err := s.tpr.GetDomainDeps.Query(ev.Name)
+	if err != nil {
+		return fmt.Errorf("can't get domain deps: %v", err)
+	}
+	defer rows.Close()
+
+	depUpdates := []ncbtcjsontypes.NameSyncEvent{}
+
+	for rows.Next() {
+		var depName, depValue string
+
+		err := rows.Scan(&depName, &depValue)
+		if err != nil {
+			return err
+		}
+
+		// Fabricate an update event.
+		depUpdates = append(depUpdates, ncbtcjsontypes.NameSyncEvent{
+			Type:  "update",
+			Name:  depName,
+			Value: depValue,
+		})
+	}
+
+	rows.Close()
+
+	for _, psuedoEvent := range depUpdates {
+		err = s.processUpdate(psuedoEvent)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// Determine the namecoin domain ID, creating the record if it doesn't
+// already exist. Update the block height and value.
+func (s *Server) setDomainValue(name, value string, curBlockHeight int64) (domainID int64, err error) {
+	err = s.tpr.GetDomainID.QueryRow(name).Scan(&domainID)
+	if err != nil {
+		err = s.tpr.InsertDomain.QueryRow(name, curBlockHeight, value).Scan(&domainID)
+	} else {
+		_, err = s.tpr.UpdateDomain.Exec(curBlockHeight, value, domainID)
+	}
+	return
+}
+
+func (s *Server) processAtblock(ev ncbtcjsontypes.NameSyncEvent, commit bool) error {
+	err := s.appendCurrentState(ev.BlockHash, int64(ev.BlockHeight))
+	if err != nil {
+		return err
+	}
+
+	err = s.sendNotifications()
+	if err != nil {
+		return err
+	}
+
+	if commit {
+		err = s.commit()
+		if err != nil {
+			return err
+		}
+	}
+
+	s.curBlockHash = ev.BlockHash
+	s.curBlockHeight = int64(ev.BlockHeight)
+	log.Infof("atblock %d", s.curBlockHeight)
+
+	return nil
+}
+
+func (s *Server) appendCurrentState(blockHash string, blockHeight int64) error {
+	_, err := s.tpr.UpdateState.Exec(blockHash, blockHeight)
+	if err != nil {
+		return err
+	}
+
+	err = s.addPrevBlock(blockHash, blockHeight)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Server) addPrevBlock(blockHash string, blockHeight int64) error {
+	var prevBlockID int64
+	err := s.tpr.InsertPrevBlock.QueryRow(blockHash, blockHeight).Scan(&prevBlockID)
+	if err != nil {
+		return err
+	}
+
+	if prevBlockID > numPrevBlocksToKeep {
+		_, err = s.tpr.TruncatePrevBlock.Exec(prevBlockID - numPrevBlocksToKeep)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *Server) sendNotifications() error {
+	defer s.clearNotifications()
+
+	if !s.shouldNotify() {
+		return nil
+	}
+
+	updateds := "inv"
+	for k := range s.updatedSet {
+		updateds += " " + k
+		if len(updateds) > 6000 {
+			_, err := s.tpr.Notify.Exec(updateds)
+			if err != nil {
+				return err
+			}
+			updateds = "inv"
+		}
+	}
+
+	if len(updateds) > 3 {
+		_, err := s.tpr.Notify.Exec(updateds)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *Server) shouldNotify() bool {
+	return s.cfg.Notify && !s.isCatchingUp()
+}
+
+func (s *Server) isCatchingUp() bool {
+	return s.curBlockHeight < s.maxBlockHeightAtStart-2
+}
+
+func (s *Server) clearNotifications() {
+	s.updatedSet = map[string]struct{}{}
+}
+
+func (s *Server) setNotification(name string) {
+	s.updatedSet[name] = struct{}{}
+}
+
+func (s *Server) insertRRs(rrs []dns.RR, domainID int64) error {
+	nsSuffix := []string{}
+
+	for _, rr := range rrs {
+		name := normalizeName(rr.Header().Name)
+
+		if len(nsSuffix) > 0 && !domainHasSuffix(name, nsSuffix[len(nsSuffix)-1]) {
+			nsSuffix = nsSuffix[0 : len(nsSuffix)-1]
+		}
+
+		if rr.Header().Rrtype == dns.TypeNS {
+			nsSuffix = append(nsSuffix, name)
+		}
+
+		depthBelowNS := 0
+		if len(nsSuffix) > 0 {
+			subPart := normalizeName(name[0 : len(name)-len(nsSuffix[len(nsSuffix)-1])])
+			depthBelowNS = strings.Count(subPart, ".")
+			if len(subPart) > 0 {
+				depthBelowNS++
+			}
+		}
+
+		err := s.insertRR(rr, domainID, len(nsSuffix) > 0, depthBelowNS)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *Server) insertRR(rr dns.RR, domainID int64, hasNS bool, depthBelowNS int) error {
+	stype, value, prio, err := convertRRData(rr)
+	if err != nil {
+		return err
+	}
+
 	hdr := rr.Header()
-	stype := dns.TypeToString[hdr.Rrtype]
-	value := ""
+
+	auth := !hasNS || (hdr.Rrtype == dns.TypeDS && depthBelowNS == 0)
+
+	orderName, err := s.determineOrderName(hdr.Name)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.tpr.InsertRecord.Exec(prio, domainID, normalizeName(hdr.Name), stype, value, auth, orderName)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Server) determineOrderName(name string) (orderName sql.NullString, err error) {
+	switch s.cfg.NSECMode {
+	case "nsec3narrow":
+		// no orderName
+	case "nsec3":
+		orderName.String = strings.ToLower(dns.HashName(name, s.nsec3param.Hash, s.nsec3param.Iterations, s.nsec3param.Salt))
+		orderName.Valid = true
+	}
+
+	return
+}
+
+func convertRRData(rr dns.RR) (stype, value string, prio int, err error) {
+	hdr := rr.Header()
+	stype = dns.TypeToString[hdr.Rrtype]
 
 	if stype == "" {
 		panic(fmt.Sprintf("no rr type: %+v", rr))
@@ -534,13 +699,10 @@ func insertRR(stmt *sql.Stmt, rr dns.RR, domainID int64, hasNS bool, depthBelowN
 	switch hdr.Rrtype {
 	case dns.TypeA:
 		value = rr.(*dns.A).A.String()
-
 	case dns.TypeAAAA:
 		value = rr.(*dns.AAAA).AAAA.String()
-
 	case dns.TypeNS:
 		value = normalizeName(rr.(*dns.NS).Ns)
-
 	case dns.TypeDS:
 		ds := rr.(*dns.DS)
 		value = fmt.Sprintf("%d %d %d %s", ds.KeyTag, ds.Algorithm, ds.DigestType, strings.ToUpper(ds.Digest))
@@ -572,86 +734,23 @@ func insertRR(stmt *sql.Stmt, rr dns.RR, domainID int64, hasNS bool, depthBelowN
 				value += " "
 			}
 			first = false
-			value += "\""
+			value += `"`
 			for _, c := range t {
 				if c == '"' {
-					value += "\""
+					value += `"`
 				} else {
 					value += string(c)
 				}
 			}
-			value += "\""
+			value += `"`
 		}
 
 	default:
-		return fmt.Errorf("unsupported record type: %s", rr.Header())
+		err = fmt.Errorf("unsupported record type: %s", rr.Header())
+		return
 	}
 
-	auth := !hasNS || (rr.Header().Rrtype == dns.TypeDS && depthBelowNS == 0)
-
-	ordername := sql.NullString{}
-	switch nsecMode {
-	case "nsec3narrow":
-	case "nsec3":
-		ordername.String = strings.ToLower(dns.HashName(rr.Header().Name, dns.SHA1, 0, "8F"))
-		ordername.Valid = true
-	case "nsec":
-		panic("unsupported NSEC mode")
-	default:
-		panic("unsupported NSEC mode")
-	}
-
-	_, err := stmt.Exec(prio, domainID, normalizeName(hdr.Name), stype, value, auth, ordername)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func insertRRs(stmt *sql.Stmt, rrs []dns.RR, domainID int64, nsecMode string) error {
-	nsSuffix := []string{}
-
-	for _, rr := range rrs {
-		// XXX: this currently relies on a specific ordering of RRs:
-		//      a.b.c
-		//      x.a.b.c
-		//      1.x.a.b.c
-		//      2.x.a.b.c
-		//      y.a.b.c
-		//      b.b.c
-		//      plus the assumption that at a given owner name, NS records
-		//      always come first.
-		//      RRsRecursive currently gives this ordering.
-
-		// We are no longer in the current delegation level, pop it off.
-		name := normalizeName(rr.Header().Name)
-
-		if len(nsSuffix) > 0 && !domainHasSuffix(name, nsSuffix[len(nsSuffix)-1]) {
-			nsSuffix = nsSuffix[0 : len(nsSuffix)-1]
-		}
-
-		// Enter a new delegation level.
-		if rr.Header().Rrtype == dns.TypeNS {
-			nsSuffix = append(nsSuffix, name)
-		}
-
-		depthBelowNS := 0
-		if len(nsSuffix) > 0 {
-			subPart := normalizeName(name[0 : len(name)-len(nsSuffix[len(nsSuffix)-1])])
-			depthBelowNS = strings.Count(subPart, ".")
-			if len(subPart) > 0 {
-				depthBelowNS++
-			}
-		}
-
-		err := insertRR(stmt, rr, domainID, len(nsSuffix) > 0, depthBelowNS, nsecMode)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return
 }
 
 func domainHasSuffix(x, y string) bool {
@@ -677,5 +776,3 @@ func normalizeName(n string) string {
 	}
 	return n
 }
-
-// © 2014 Hugo Landau <hlandau@devever.net>    GPLv3 or later

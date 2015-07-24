@@ -23,19 +23,20 @@ func main() {
 				smgr.SetStatus("namesync: " + status)
 			}
 
+			cfg.StartedNotifyFunc = func() error {
+				err := smgr.DropPrivileges()
+				if err != nil {
+					return err
+				}
+
+				smgr.SetStarted()
+				return nil
+			}
+
 			cfg.StatusUpdateFunc("starting")
 
 			go func() {
-				err := server.Run(cfg, func() error {
-					err := smgr.DropPrivileges()
-					if err != nil {
-						return err
-					}
-
-					smgr.SetStarted()
-
-					return nil
-				})
+				err := server.Run(cfg)
 				doneChan <- err
 			}()
 
