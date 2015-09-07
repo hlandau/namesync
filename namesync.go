@@ -7,8 +7,7 @@ import "github.com/hlandau/namesync/server"
 func main() {
 	cfg := server.Config{}
 	config := config.Configurator{
-		ProgramName:     "namesync",
-		ConfigFilePaths: []string{"$BIN/../etc/namesync.conf", "/etc/namesync/namesync.conf"},
+		ProgramName: "namesync",
 	}
 	config.ParseFatal(&cfg)
 
