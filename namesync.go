@@ -1,12 +1,12 @@
 package main
 
-import "github.com/hlandau/degoutils/config"
-import "gopkg.in/hlandau/service.v1"
+import "gopkg.in/hlandau/easyconfig.v1"
+import "gopkg.in/hlandau/service.v2"
 import "github.com/hlandau/namesync/server"
 
 func main() {
 	cfg := server.Config{}
-	config := config.Configurator{
+	config := easyconfig.Configurator{
 		ProgramName: "namesync",
 	}
 	config.ParseFatal(&cfg)
