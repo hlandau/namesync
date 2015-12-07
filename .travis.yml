@@ -1,12 +1,28 @@
 language: go
 go:
-  - 1.3
-  - tip
-before_install:
-  - if [ "$TRAVIS_OS_NAME" == "linux" ]; then travis_retry sudo apt-get update -qq; fi
-  - if [ "$TRAVIS_OS_NAME" == "linux" ]; then travis_retry sudo apt-get install -qq libcap-dev; fi
-notifications:
-  irc:
-    channels:
-      - "chat.freenode.net##hl-t"
-    skip_join: true
+  - 1.5.2
+
+os:
+  - linux
+#  - osx
+
+addons:
+  apt:
+    packages:
+      - gcc-multilib
+      - libc6-dev:i386
+      - libcap-dev
+      - libcap-dev:i386
+
+sudo: false
+
+install:
+  - go get -v -t ./...
+script:
+  - source ./.travis/script
+after_success:
+  - source ./.travis/after_success
+
+env:
+  # GITHUB_TOKEN for automatic releases
+  - secure: "YbRGJw8xebu4W0jImsefxiAAnABTvoDkTPeYEAABKNVOsuqn+zqHBvLAWHSLuB1ki9xKmcVd5HRaUU/csxkmA83/D3BCrZRhjL2NvJ5u7Mdy7Z4uLoROQkqwiLau7Nm4rA7dlkspkv8ew5CaHOV6OLHd0M1KZx0ofynqvA0f68g="

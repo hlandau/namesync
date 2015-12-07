@@ -1,0 +1,6 @@
+NamecoinRPCAddress="127.0.0.1:8332"
+NamecoinRPCUsername="username"
+NamecoinRPCPassword="password"
+DatabaseType="postgres"
+DatabaseURL="user=pgusername dbname=pgdbname sslmode=disable password=pgpassword"
+Notify=false

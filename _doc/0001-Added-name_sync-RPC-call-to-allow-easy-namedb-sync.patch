@@ -1,0 +1,194 @@
+From c2dacbee14582c96bcc1f649a2cb5bd02ad1c2b3 Mon Sep 17 00:00:00 2001
+From: Hugo Landau <hlandau@devever.net>
+Date: Mon, 24 Nov 2014 23:18:01 +0000
+Subject: [PATCH] Added name_sync RPC call to allow easy namedb sync
+
+The name_sync call allows the Namecoin name database to be easily
+synchronized to an external SQL or other database.
+
+For more details, see
+<https://github.com/hlandau/namesync.t/blob/master/doc/name_sync.md>.
+---
+ src/rpcclient.cpp |   2 +
+ src/rpcnames.cpp  | 126 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/rpcserver.cpp |   1 +
+ src/rpcserver.h   |   1 +
+ 4 files changed, 130 insertions(+)
+
+diff --git a/src/rpcclient.cpp b/src/rpcclient.cpp
+index c093ddd..4256f07 100644
+--- a/src/rpcclient.cpp
++++ b/src/rpcclient.cpp
+@@ -90,6 +90,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
+     { "prioritisetransaction", 1 },
+     { "prioritisetransaction", 2 },
+     { "name_scan", 1 },
++    { "name_sync", 1 },
++    { "name_sync", 2 },
+     { "name_filter", 1 },
+     { "name_filter", 2 },
+     { "name_filter", 3 },
+diff --git a/src/rpcnames.cpp b/src/rpcnames.cpp
+index 7880f13..85c3964 100644
+--- a/src/rpcnames.cpp
++++ b/src/rpcnames.cpp
+@@ -366,6 +366,132 @@ name_scan (const json_spirit::Array& params, bool fHelp)
+   return walker.getArray ();
+ }
+ 
++json_spirit::Value
++name_sync (const json_spirit::Array& params, bool fHelp)
++{
++  if (fHelp || params.size() < 2 || params.size() > 3)
++    throw std::runtime_error (
++        "name_sync \"block_hash\" \"count\" (\"wait\")\n"
++        "\nList events for synchronizing with a database\n"
++        "\nArguments:\n"
++        "1. \"block_hash\"    (string, required) hex-encoded block hash to start synchronization from\n"
++        "2. \"count\"         (integer, required) approximate number of events to return\n"
++        "3. \"wait\"          (boolean, optional) wait until there are events to return (default: false)\n"
++        "\nResult:\n"
++        "[\n"
++        "  [\"update\", \"d/example\", \"{}\"],\n"
++        "  [\"expire\", \"d/example2\"],\n"
++        "  [\"atblock\", \"blockhash...\", blockheight]\n"
++        "]\n"
++      );
++
++  bool wait = false;
++
++  std::string strHash = params[0].get_str();
++  uint256 hash(strHash);
++
++  int count = params[1].get_int();
++  if (count < 0)
++    return json_spirit::Array();
++
++  if (params.size() > 2)
++    wait = params[2].get_bool();
++
++  if (mapBlockIndex.count(hash) == 0)
++    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");
++
++  CBlock block;
++  CBlockIndex* pblockindex = mapBlockIndex[hash];
++
++  if (!ReadBlockFromDisk(block, pblockindex))
++    throw JSONRPCError(RPC_INTERNAL_ERROR, "Can't read block from disk");
++
++  int height = pblockindex->nHeight;
++  int maxHeight = chainActive.Height();
++
++  if (wait && height == maxHeight) {
++    // Release the wallet and main lock while waiting
++#ifdef ENABLE_WALLET
++    if (pwalletMain)
++      LEAVE_CRITICAL_SECTION(pwalletMain->cs_wallet);
++#endif
++    LEAVE_CRITICAL_SECTION(cs_main);
++    {
++      boost::unique_lock<boost::mutex> lock(csBestBlock);
++      while (chainActive.Height() == maxHeight && IsRPCRunning()) {
++        cvBlockChange.wait(lock);
++      }
++
++      maxHeight = chainActive.Height();
++    }
++    ENTER_CRITICAL_SECTION(cs_main);
++#ifdef ENABLE_WALLET
++    if (pwalletMain)
++      ENTER_CRITICAL_SECTION(pwalletMain->cs_wallet);
++#endif
++
++    if (!IsRPCRunning())
++      throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "Shutting down");
++  }
++
++  json_spirit::Array events;
++
++  int numEmitted = 0;
++
++  for (int curHeight=height+1; curHeight <= maxHeight; ++curHeight) {
++    if (numEmitted > count)
++      break;
++
++    pblockindex = chainActive[curHeight];
++
++    if (!ReadBlockFromDisk(block, pblockindex))
++      throw JSONRPCError(RPC_INTERNAL_ERROR, "Can't read block from disk");
++
++    bool emitted = false;
++
++    for (unsigned txIdx=0; txIdx<block.vtx.size(); ++txIdx) {
++      const CTransaction &tx = block.vtx[txIdx];
++      if (!tx.IsNamecoin())
++        continue;
++
++      for (unsigned outputIdx=0; outputIdx<tx.vout.size(); ++outputIdx) {
++        const CNameScript op(tx.vout[outputIdx].scriptPubKey);
++        if (op.isNameOp() && op.isAnyUpdate()) {
++          const valtype& name = op.getOpName();
++          const valtype& value = op.getOpValue();
++
++          json_spirit::Array ev;
++          ev.push_back((op.getNameOp() == OP_NAME_FIRSTUPDATE) ? "firstupdate" : "update");
++          ev.push_back(ValtypeToString(name));
++          ev.push_back(ValtypeToString(value));
++
++          events.push_back(ev);
++          emitted = true;
++          ++numEmitted;
++        }
++      }
++    }
++
++    // Always emit atblock when finishing (if we advanced through any blocks at
++    // all). We need to do this so that the client will always end up calling
++    // name_sync with the current block hash (after a number of calls), even if
++    // the last few blocks contain no name operations. That in turn is
++    // necessary for long polling to work, as long polling mode will only be
++    // entered when the client calls with the current block hash.
++    bool willTerminate = ((curHeight + 1) > maxHeight || numEmitted > count);
++    if (emitted || willTerminate) {
++      // emit atblock
++      json_spirit::Array atblock;
++      atblock.push_back("atblock");
++      atblock.push_back(pblockindex->GetBlockHash().GetHex());
++      atblock.push_back((uint64_t)curHeight);
++      events.push_back(atblock);
++    }
++  }
++
++  return events;
++}
++
+ /* ************************************************************************** */
+ 
+ /**
+diff --git a/src/rpcserver.cpp b/src/rpcserver.cpp
+index f21d887..71ab23d 100644
+--- a/src/rpcserver.cpp
++++ b/src/rpcserver.cpp
+@@ -309,6 +309,7 @@ static const CRPCCommand vRPCCommands[] =
+     { "namecoin",           "name_scan",              &name_scan,              true,      false,      false },
+     { "namecoin",           "name_filter",            &name_filter,            true,      false,      false },
+     { "namecoin",           "name_checkdb",           &name_checkdb,           true,      false,      false },
++    { "namecoin",           "name_sync",              &name_sync,              true,      false,      false },
+ #ifdef ENABLE_WALLET
+     { "namecoin",           "name_list",              &name_list,              true,      false,      true },
+     { "namecoin",           "name_new",               &name_new,               false,     false,      true },
+diff --git a/src/rpcserver.h b/src/rpcserver.h
+index e34376d..216af5e 100644
+--- a/src/rpcserver.h
++++ b/src/rpcserver.h
+@@ -233,6 +233,7 @@ extern bool HTTPReq_REST(AcceptedConnection *conn,
+ extern void AddRawTxNameOperation(CMutableTransaction& tx, const json_spirit::Object& obj);
+ 
+ extern json_spirit::Value name_show(const json_spirit::Array& params, bool fHelp);
++extern json_spirit::Value name_sync(const json_spirit::Array& params, bool fHelp);
+ extern json_spirit::Value name_history(const json_spirit::Array& params, bool fHelp);
+ extern json_spirit::Value name_scan(const json_spirit::Array& params, bool fHelp);
+ extern json_spirit::Value name_filter(const json_spirit::Array& params, bool fHelp);
+-- 
+2.2.1
+
